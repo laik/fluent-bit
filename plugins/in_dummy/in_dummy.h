@@ -27,11 +27,16 @@
 #define DEFAULT_DUMMY_MESSAGE "{\"message\":\"dummy\"}"
 
 struct flb_dummy {
+    int samples;
+    int samples_count;
     char *dummy_message;
     int    dummy_message_len;
 
     char *ref_msgpack;
     size_t ref_msgpack_size;
+
+    struct flb_time *dummy_timestamp;
+    struct flb_time *base_timestamp;
     struct flb_input_instance *ins;
 };
 

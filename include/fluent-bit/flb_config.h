@@ -31,10 +31,6 @@
 
 #include <monkey/mk_core.h>
 
-#ifdef FLB_HAVE_TLS
-#include <fluent-bit/flb_io_tls.h>
-#endif
-
 #define FLB_CONFIG_FLUSH_SECS   5
 #define FLB_CONFIG_HTTP_LISTEN  "0.0.0.0"
 #define FLB_CONFIG_HTTP_PORT    "2020"
@@ -45,6 +41,7 @@ struct flb_config {
     struct mk_event ch_event;
 
     int support_mode;         /* enterprise support mode ?      */
+    int is_ingestion_active;  /* date ingestion active/allowed  */
     int is_running;           /* service running ?              */
     double flush;             /* Flush timeout                  */
     int grace;                /* Grace on shutdown              */
@@ -124,6 +121,9 @@ struct flb_config {
     /* Environment */
     void *env;
 
+    /* Exit status code */
+    int exit_status_code;
+
     /* Workers: threads spawn using flb_worker_create() */
     struct mk_list workers;
 
@@ -140,14 +140,27 @@ struct flb_config {
     void *http_ctx;           /* Monkey HTTP context    */
 #endif
 
+    /*
+     * There are two ways to use proxy in fluent-bit:
+     * 1. Similar with http and datadog plugin, passing proxy directly to
+     *    flb_http_client and use proxy host and port when creating upstream.
+     *    HTTPS traffic is not supported this way.
+     * 2. Similar with stackdriver plugin, passing http_proxy in flb_config
+     *    (or by setting HTTP_PROXY env variable). HTTPS is supported this way. But
+     *    proxy shouldn't be passed when calling flb_http_client().
+     */
+    char *http_proxy;
+
     /* Chunk I/O Buffering */
     void *cio;
     char *storage_path;
     void *storage_input_plugin;
     char *storage_sync;             /* sync mode */
+    int   storage_metrics;          /* enable/disable storage metrics */
     int   storage_checksum;         /* checksum enabled */
     int   storage_max_chunks_up;    /* max number of chunks 'up' in memory */
     char *storage_bl_mem_limit;     /* storage backlog memory limit */
+    struct flb_storage_metrics *storage_metrics_ctx; /* storage metrics context */
 
     /* Embedded SQL Database support (SQLite3) */
 #ifdef FLB_HAVE_SQLDB
@@ -173,6 +186,9 @@ struct flb_config {
     /* Co-routines */
     unsigned int coro_stack_size;
 
+    /* Upstream contexts created by plugins */
+    struct mk_list upstreams;
+
     /*
      * Input table-id: table to keep a reference of thread-IDs used by the
      * input plugins.
@@ -182,6 +198,8 @@ struct flb_config {
     void *sched;
 
     struct flb_task_map tasks_map[2048];
+
+    int dry_run;
 };
 
 #define FLB_CONFIG_LOG_LEVEL(c) (c->log->level)
@@ -231,6 +249,7 @@ enum conf_type {
 /* Storage / Chunk I/O */
 #define FLB_CONF_STORAGE_PATH          "storage.path"
 #define FLB_CONF_STORAGE_SYNC          "storage.sync"
+#define FLB_CONF_STORAGE_METRICS       "storage.metrics"
 #define FLB_CONF_STORAGE_CHECKSUM      "storage.checksum"
 #define FLB_CONF_STORAGE_BL_MEM_LIMIT  "storage.backlog.mem_limit"
 #define FLB_CONF_STORAGE_MAX_CHUNKS_UP "storage.max_chunks_up"

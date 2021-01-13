@@ -28,6 +28,9 @@
 #include <fluent-bit/flb_filter.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_coro.h>
+#include <fluent-bit/flb_callback.h>
+#include <fluent-bit/tls/flb_tls.h>
 
 #include <signal.h>
 #include <stdarg.h>
@@ -104,7 +107,8 @@ static inline struct flb_filter_instance *filter_instance_get(flb_ctx_t *ctx,
 
 void flb_init_env()
 {
-    flb_thread_prepare();
+    flb_tls_init();
+    flb_coro_init();
     flb_output_prepare();
 }
 
@@ -189,6 +193,10 @@ flb_ctx_t *flb_create()
 /* Release resources associated to the library context */
 void flb_destroy(flb_ctx_t *ctx)
 {
+    if (!ctx) {
+        return;
+    }
+
     if (ctx->event_channel) {
         mk_event_del(ctx->event_loop, ctx->event_channel);
         flb_free(ctx->event_channel);
@@ -197,6 +205,7 @@ void flb_destroy(flb_ctx_t *ctx)
     /* Remove resources from the event loop */
     mk_event_loop_destroy(ctx->event_loop);
     flb_free(ctx);
+    ctx = NULL;
 
 #ifdef FLB_HAVE_MTRACE
     /* Stop tracing malloc and free */
@@ -307,6 +316,52 @@ int flb_output_set(flb_ctx_t *ctx, int ffd, ...)
     }
 
     va_end(va);
+    return 0;
+}
+
+int flb_output_set_callback(flb_ctx_t *ctx, int ffd, char *name,
+                            void (*cb)(char *, void *, void *))
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    return flb_callback_set(o_ins->callback, name, cb);
+}
+
+int flb_output_set_test(flb_ctx_t *ctx, int ffd, char *test_name,
+                        void (*out_callback) (void *, int, int, void *, size_t, void *),
+                        void *out_callback_data,
+                        void *test_ctx)
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    /*
+     * Enabling a test, set the output instance in 'test' mode, so no real
+     * flush callback is invoked, only the desired implemented test.
+     */
+
+    /* Formatter test */
+    if (strcmp(test_name, "formatter") == 0) {
+        o_ins->test_mode = FLB_TRUE;
+        o_ins->test_formatter.rt_ctx = ctx;
+        o_ins->test_formatter.rt_ffd = ffd;
+        o_ins->test_formatter.rt_out_callback = out_callback;
+        o_ins->test_formatter.rt_data = out_callback_data;
+        o_ins->test_formatter.flush_ctx = test_ctx;
+    }
+    else {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -429,14 +484,17 @@ int flb_lib_push(flb_ctx_t *ctx, int ffd, const void *data, size_t len)
 static void flb_lib_worker(void *data)
 {
     int ret;
-    struct flb_config *config = data;
+    flb_ctx_t *ctx = data;
+    struct flb_config *config;
 
-    flb_log_init(config, FLB_LOG_STDERR, FLB_LOG_INFO, NULL);
+    config = ctx->config;
+    mk_utils_worker_rename("flb-pipeline");
     ret = flb_engine_start(config);
     if (ret == -1) {
         flb_engine_failed(config);
         flb_engine_shutdown(config);
     }
+    ctx->status = FLB_LIB_NONE;
 }
 
 /* Return the current time to be used by lib callers */
@@ -462,7 +520,7 @@ int flb_start(flb_ctx_t *ctx)
     pthread_once(&flb_lib_once, flb_init_env);
 
     config = ctx->config;
-    ret = mk_utils_worker_spawn(flb_lib_worker, config, &tid);
+    ret = mk_utils_worker_spawn(flb_lib_worker, ctx, &tid);
     if (ret == -1) {
         return -1;
     }
@@ -490,6 +548,14 @@ int flb_start(flb_ctx_t *ctx)
         }
     }
 
+    return 0;
+}
+
+int flb_loop(flb_ctx_t *ctx)
+{
+    while (ctx->status == FLB_LIB_OK) {
+        sleep(1);
+    }
     return 0;
 }
 

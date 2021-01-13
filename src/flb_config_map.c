@@ -20,23 +20,13 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_kv.h>
+#include <fluent-bit/flb_env.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_slist.h>
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_config_map.h>
-
-static int expect_n_values(int type)
-{
-    if (type > FLB_CONFIG_MAP_CLIST && type < FLB_CONFIG_MAP_SLIST) {
-        return type - FLB_CONFIG_MAP_CLIST;
-    }
-    if (type > FLB_CONFIG_MAP_SLIST && type <= FLB_CONFIG_MAP_SLIST_4) {
-        return type - FLB_CONFIG_MAP_SLIST;
-    }
-    return -1;
-}
 
 static int check_list_size(struct mk_list *list, int type)
 {
@@ -102,7 +92,7 @@ static struct mk_list *parse_string_map_to_list(struct flb_config_map *map, char
         ret = flb_slist_split_string(list, str, ',', max_split);
     }
     else if (type == FLB_CONFIG_MAP_SLIST) {
-        ret = flb_slist_split_string(list, str, ' ', max_split);
+        ret = flb_slist_split_tokens(list, str, max_split);
     }
 
     if (ret == -1) {
@@ -258,9 +248,11 @@ static flb_sds_t helper_map_options(struct mk_list *map)
  * In addition, for default values, we process them and populate the 'value' field with
  * proper data types.
  */
-struct mk_list *flb_config_map_create(struct flb_config_map *map)
+struct mk_list *flb_config_map_create(struct flb_config *config,
+                                      struct flb_config_map *map)
 {
     int ret;
+    flb_sds_t env;
     struct mk_list *tmp;
     struct mk_list *list;
     struct flb_config_map *new = NULL;
@@ -293,7 +285,23 @@ struct mk_list *flb_config_map_create(struct flb_config_map *map)
 
         new->type = m->type;
         new->name = flb_sds_create(m->name);
-        new->def_value = m->def_value;
+
+        /* Translate default value */
+        if (m->def_value) {
+            /*
+             * Before to translate any value, make sure to disable the warning
+             * about unused variables. This might happen if a default value is an
+             * environment variable and the user is not using it (which is ok for
+             * that specific use case).
+             */
+            flb_env_warn_unused(config->env, FLB_FALSE);
+
+            /* Translate the value */
+            env = flb_env_var_translate(config->env, m->def_value);
+            new->def_value = env;
+            flb_env_warn_unused(config->env, FLB_TRUE);
+        }
+
         new->flags = m->flags;
         new->set_property = m->set_property;
         new->offset = m->offset;
@@ -327,7 +335,7 @@ struct mk_list *flb_config_map_create(struct flb_config_map *map)
         }
 
         /* Assign value based on data type and multiple mode if set */
-        ret = translate_default_value(new, m->def_value);
+        ret = translate_default_value(new, new->def_value);
         if (ret == -1) {
             flb_config_map_destroy(list);
             return NULL;
@@ -377,6 +385,9 @@ void flb_config_map_destroy(struct mk_list *list)
         else {
             destroy_map_val(map->type, &map->value);
         }
+        if (map->def_value) {
+            flb_sds_destroy(map->def_value);
+        }
         flb_sds_destroy(map->name);
         flb_free(map);
     }
@@ -403,6 +414,22 @@ int property_count(char *key, int len, struct mk_list *properties)
     return count;
 }
 
+/*
+ * If the property starts with '_debug.', it's an internal property for
+ * some component of Fluent Bit, not the plugin it self.
+ */
+static int is_internal_debug_property(char *prop_name)
+{
+#ifdef FLB_HAVE_HTTP_CLIENT_DEBUG
+    if (strncmp(prop_name, "_debug.http.", 12) == 0) {
+        return FLB_TRUE;
+    }
+#endif
+
+    return FLB_FALSE;
+}
+
+
 /* Validate that the incoming properties set by the caller are allowed by the plugin */
 int flb_config_map_properties_check(char *context_name,
                                     struct mk_list *in_properties,
@@ -411,6 +438,7 @@ int flb_config_map_properties_check(char *context_name,
     int len;
     int found;
     int count = 0;
+    int ret;
     flb_sds_t helper;
     struct flb_kv *kv;
     struct mk_list *head;
@@ -421,6 +449,13 @@ int flb_config_map_properties_check(char *context_name,
     mk_list_foreach(head, in_properties) {
         kv = mk_list_entry(head, struct flb_kv, _head);
         found = FLB_FALSE;
+
+
+        ret = is_internal_debug_property(kv->key);
+        if (ret == FLB_TRUE) {
+            /* Skip the config map */
+            continue;
+        }
 
         /* Lookup the key into the provided map */
         mk_list_foreach(m_head, map) {
@@ -502,6 +537,22 @@ static int properties_override_default(struct mk_list *properties, char *name)
 }
 
 /*
+ * Return the number of expected values if the property type is from CLIST
+ * or SLIST family.
+ */
+int flb_config_map_expected_values(int type)
+{
+    if (type > FLB_CONFIG_MAP_CLIST && type < FLB_CONFIG_MAP_SLIST) {
+        return type - FLB_CONFIG_MAP_CLIST;
+    }
+    if (type > FLB_CONFIG_MAP_SLIST && type <= FLB_CONFIG_MAP_SLIST_4) {
+        return type - FLB_CONFIG_MAP_SLIST;
+    }
+    return -1;
+}
+
+
+/*
  * Function used by plugins that needs to populate their context structure with the
  * configuration properties already mapped.
  */
@@ -534,7 +585,7 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
          * for a linked list. We just point their structure to our pre-processed
          * list of entries.
          */
-        if (m->flags & FLB_CONFIG_MAP_MULT) {
+        if (m->flags & FLB_CONFIG_MAP_MULT && m->set_property == FLB_TRUE) {
             m_list = (struct mk_list **) (base + m->offset);
             *m_list = m->value.mult;
             continue;
@@ -596,6 +647,9 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
      */
     mk_list_foreach(head, properties) {
         kv = mk_list_entry(head, struct flb_kv, _head);
+        if (kv->val == NULL) {
+            continue;
+        }
 
         mk_list_foreach(m_head, map) {
             m = mk_list_entry(m_head, struct flb_config_map, _head);
@@ -619,7 +673,7 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
         /* Check if the map allows multiple entries */
         if (m->flags & FLB_CONFIG_MAP_MULT) {
             /* Create node */
-            entry = flb_malloc(sizeof(struct flb_config_map_val));
+            entry = flb_calloc(1, sizeof(struct flb_config_map_val));
             if (!entry) {
                 flb_errno();
                 return -1;
@@ -627,7 +681,7 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
 
             /* Populate value */
             if (m->type == FLB_CONFIG_MAP_STR) {
-                entry->val.str = kv->val;
+                entry->val.str = flb_sds_create(kv->val);
             }
             else if (m->type == FLB_CONFIG_MAP_INT) {
                 entry->val.i_num = atoi(kv->val);
@@ -668,7 +722,8 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
                 if (ret == -1) {
                     flb_error("[config map] property '%s' expects %i values "
                               "(only %i were found)",
-                              kv->key, expect_n_values(m->type), len);
+                              kv->key,
+                              flb_config_map_expected_values(m->type), len);
                     /*
                      * Register the entry anyways, so on exit the resources will
                      * be released

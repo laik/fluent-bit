@@ -27,6 +27,7 @@
 #include <fluent-bit/flb_upstream.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/tls/flb_tls.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -551,7 +552,9 @@ static int merge_meta(struct flb_kube_meta *meta, struct flb_kube *ctx,
                 k = api_map.via.map.ptr[i].key;
                 if (k.via.str.size == 8 && !strncmp(k.via.str.ptr, "metadata", 8)) {
                     meta_val = api_map.via.map.ptr[i].val;
-                    meta_found = FLB_TRUE;
+                    if (meta_val.type == MSGPACK_OBJECT_MAP) {
+                        meta_found = FLB_TRUE;
+                    }
                 }
                 else if (k.via.str.size == 4 && !strncmp(k.via.str.ptr, "spec", 4)) {
                    spec_val = api_map.via.map.ptr[i].val;
@@ -885,9 +888,12 @@ static int get_and_merge_meta(struct flb_kube *ctx, struct flb_kube_meta *meta,
     char *api_buf;
     size_t api_size;
 
-    get_api_server_info(ctx,
-                        meta->namespace, meta->podname,
-                        &api_buf, &api_size);
+    ret = get_api_server_info(ctx,
+                              meta->namespace, meta->podname,
+                              &api_buf, &api_size);
+    if (ret == -1) {
+        return -1;
+    }
 
     ret = merge_meta(meta, ctx,
                      api_buf, api_size,
@@ -900,6 +906,31 @@ static int get_and_merge_meta(struct flb_kube *ctx, struct flb_kube_meta *meta,
     return ret;
 }
 
+/*
+ * Work around kubernetes/kubernetes/issues/78479 by waiting
+ * for DNS to start up.
+ */
+static int wait_for_dns(struct flb_kube *ctx)
+{
+    int i;
+    struct addrinfo *res;
+    struct addrinfo hints;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    for (i = 0; i < ctx->dns_retries; i++) {
+        if (getaddrinfo(ctx->api_host, NULL, &hints, &res) == 0) {
+            freeaddrinfo(res);
+            return 0;
+        }
+        flb_plg_info(ctx->ins, "Wait %i secs until DNS starts up (%i/%i)",
+                     ctx->dns_wait_time, i + 1, ctx->dns_retries);
+        sleep(ctx->dns_wait_time);
+    }
+    return -1;
+}
 
 static int flb_kube_network_init(struct flb_kube *ctx, struct flb_config *config)
 {
@@ -911,13 +942,13 @@ static int flb_kube_network_init(struct flb_kube *ctx, struct flb_config *config
         if (!ctx->tls_ca_path && !ctx->tls_ca_file) {
             ctx->tls_ca_file  = flb_strdup(FLB_KUBE_CA);
         }
-        ctx->tls.context = flb_tls_context_new(ctx->tls_verify,
-                                               ctx->tls_debug,
-                                               NULL, /* skip vhost */
-                                               ctx->tls_ca_path,
-                                               ctx->tls_ca_file,
-                                               NULL, NULL, NULL);
-        if (!ctx->tls.context) {
+        ctx->tls = flb_tls_create(ctx->tls_verify,
+                                  ctx->tls_debug,
+                                  ctx->tls_vhost,
+                                  ctx->tls_ca_path,
+                                  ctx->tls_ca_file,
+                                  NULL, NULL, NULL);
+        if (!ctx->tls) {
             return -1;
         }
         io_type = FLB_IO_TLS;
@@ -928,7 +959,7 @@ static int flb_kube_network_init(struct flb_kube *ctx, struct flb_config *config
                                         ctx->api_host,
                                         ctx->api_port,
                                         io_type,
-                                        &ctx->tls);
+                                        ctx->tls);
     if (!ctx->upstream) {
         /* note: if ctx->tls.context is set, it's destroyed upon context exit */
         return -1;
@@ -962,6 +993,13 @@ int flb_kube_meta_init(struct flb_kube *ctx, struct flb_config *config)
 
         /* Gather info from API server */
         flb_plg_info(ctx->ins, "testing connectivity with API server...");
+
+        ret = wait_for_dns(ctx);
+        if (ret == -1) {
+            flb_plg_warn(ctx->ins, "could not resolve %s", ctx->api_host);
+            return -1;
+        }
+
         ret = get_api_server_info(ctx, ctx->namespace, ctx->podname,
                                   &meta_buf, &meta_size);
         if (ret == -1) {

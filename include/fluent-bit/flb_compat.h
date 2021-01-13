@@ -46,6 +46,10 @@
 #define FLB_DIRCHAR '\\'
 #define PATH_MAX MAX_PATH
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISLNK(m) (0)  /* Windows doesn't support S_IFLNK */
+#define SHUT_RD   SD_RECEIVE
+#define SHUT_WR   SD_SEND
+#define SHUT_RDWR SD_BOTH
 
 /* monkey exposes a broken vsnprintf macro. Undo it  */
 #undef vsnprintf
@@ -72,6 +76,15 @@ static inline struct tm *gmtime_r(const time_t *timep, struct tm *result)
         return NULL;
     }
     return result;
+}
+
+static inline char *ctime_r(const time_t *timep, char *result)
+{
+    char *tmp = ctime(timep);
+    if (tmp == NULL) {
+        return NULL;
+    }
+    return strcpy(result, tmp);
 }
 
 /*

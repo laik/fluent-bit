@@ -26,16 +26,32 @@
 #include <monkey/mk_core.h>
 #include <msgpack.h>
 
-#define FLB_INPUT_CHUNK_SIZE 262144  /* 256KB (hint) */
+/*
+ * This variable defines a 'hint' size for new Chunks created, this
+ * value is passed to Chunk I/O.
+ */
+#define FLB_INPUT_CHUNK_SIZE           262144  /* 256KB (hint) */
+
+/*
+ * Defines a maximum size for a Chunk in the file system: note that despite
+ * this is considered a limit, a Chunk size might get greater than this.
+ */
+#define FLB_INPUT_CHUNK_FS_MAX_SIZE   2048000  /* 2MB */
 
 struct flb_input_chunk {
     int busy;                       /* buffer is being flushed  */
     int fs_backlog;                 /* chunk originated from fs backlog */
     int sp_done;                    /* sp already processed this chunk */
+#ifdef FLB_HAVE_METRICS
+    int total_records;              /* total records in the chunk */
+    int added_records;              /* recently added records */
+#endif
     void *chunk;                    /* context of struct cio_chunk */
     off_t stream_off;               /* stream offset */
     msgpack_packer mp_pck;          /* msgpack packer */
     struct flb_input_instance *in;  /* reference to parent input instance */
+    struct flb_task *task;          /* reference to the outgoing task */
+    uint64_t routes_mask;           /* track the output plugin the chunk routes to */
     struct mk_list _head;
 };
 
@@ -66,5 +82,7 @@ int flb_input_chunk_set_up_down(struct flb_input_chunk *ic);
 int flb_input_chunk_set_up(struct flb_input_chunk *ic);
 int flb_input_chunk_down(struct flb_input_chunk *ic);
 int flb_input_chunk_is_up(struct flb_input_chunk *ic);
+void flb_input_chunk_update_output_instances(struct flb_input_chunk *ic,
+                                             size_t chunk_size);
 
 #endif

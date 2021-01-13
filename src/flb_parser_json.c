@@ -131,6 +131,14 @@ int flb_parser_json_do(struct flb_parser *parser,
             continue;
         }
 
+        /* Ensure the pointer we are about to read is not NULL */
+        if (k->via.str.ptr == NULL) {
+            flb_free(mp_buf);
+            *out_buf = NULL;
+            msgpack_unpacked_destroy(&result);
+            return -1;
+        }
+
         if (strncmp(k->via.str.ptr, time_key, k->via.str.size) == 0) {
             /* We found the key, break the loop and keep the index */
             if (parser->time_keep == FLB_FALSE) {
@@ -163,9 +171,9 @@ int flb_parser_json_do(struct flb_parser *parser,
         }
         memcpy(tmp, v->via.str.ptr, len);
         tmp[len] = '\0';
-        flb_warn("[parser:%s] Invalid time format %s for '%s'.",
-                 parser->name, parser->time_fmt, tmp);
-        time_lookup = time(NULL);
+        flb_warn("[parser:%s] invalid time format %s for '%s'",
+                 parser->name, parser->time_fmt_full, tmp);
+        time_lookup = 0;
     }
     else {
         time_lookup = flb_parser_tm2time(&tm);
